@@ -22,7 +22,6 @@ import logging
 import subprocess
 import struct
 import operator
-import pathlib
 import pickle
 import weakref
 import warnings
@@ -324,8 +323,9 @@ class _TestProcess(BaseTestCase):
             self.skipTest(f'test not appropriate for {self.TYPE}')
         paths = [
             sys.executable,               # str
-            sys.executable.encode(),      # bytes
-            pathlib.Path(sys.executable)  # os.PathLike
+            os.fsencode(sys.executable),  # bytes
+            os_helper.FakePath(sys.executable),  # os.PathLike
+            os_helper.FakePath(os.fsencode(sys.executable)),  # os.PathLike bytes
         ]
         for path in paths:
             self.set_executable(path)
@@ -1331,6 +1331,23 @@ class _TestQueue(BaseTestCase):
         # Assert that the serialization and the hook have been called correctly
         self.assertTrue(not_serializable_obj.reduce_was_called)
         self.assertTrue(not_serializable_obj.on_queue_feeder_error_was_called)
+
+    def test_closed_queue_empty_exceptions(self):
+        # Assert that checking the emptiness of an unused closed queue
+        # does not raise an OSError. The rationale is that q.close() is
+        # a no-op upon construction and becomes effective once the queue
+        # has been used (e.g., by calling q.put()).
+        for q in multiprocessing.Queue(), multiprocessing.JoinableQueue():
+            q.close()  # this is a no-op since the feeder thread is None
+            q.join_thread()  # this is also a no-op
+            self.assertTrue(q.empty())
+
+        for q in multiprocessing.Queue(), multiprocessing.JoinableQueue():
+            q.put('foo')  # make sure that the queue is 'used'
+            q.close()  # close the feeder thread
+            q.join_thread()  # make sure to join the feeder thread
+            with self.assertRaisesRegex(OSError, 'is closed'):
+                q.empty()
 
     def test_closed_queue_put_get_exceptions(self):
         for q in multiprocessing.Queue(), multiprocessing.JoinableQueue():
@@ -2804,7 +2821,6 @@ class _TestPool(BaseTestCase):
         # check that we indeed waited for all jobs
         self.assertGreater(time.monotonic() - t_start, 0.9)
 
-    @support.requires_gil_enabled("gh-118413: test is flaky with GIL disabled")
     def test_release_task_refs(self):
         # Issue #29861: task arguments and results should not be kept
         # alive after we are done with them.
@@ -2813,8 +2829,8 @@ class _TestPool(BaseTestCase):
         self.pool.map(identity, objs)
 
         del objs
-        gc.collect()  # For PyPy or other GCs.
         time.sleep(DELTA)  # let threaded cleanup code run
+        support.gc_collect()  # For PyPy or other GCs.
         self.assertEqual(set(wr() for wr in refs), {None})
         # With a process pool, copies of the objects are returned, check
         # they were released too.
@@ -5537,15 +5553,29 @@ class TestStartMethod(unittest.TestCase):
             multiprocessing.set_start_method(old_method, force=True)
         self.assertGreaterEqual(count, 1)
 
-    def test_get_all(self):
+    def test_get_all_start_methods(self):
         methods = multiprocessing.get_all_start_methods()
+        self.assertIn('spawn', methods)
         if sys.platform == 'win32':
             self.assertEqual(methods, ['spawn'])
+        elif sys.platform == 'darwin':
+            self.assertEqual(methods[0], 'spawn')  # The default is first.
+            # Whether these work or not, they remain available on macOS.
+            self.assertIn('fork', methods)
+            self.assertIn('forkserver', methods)
         else:
-            self.assertTrue(methods == ['fork', 'spawn'] or
-                            methods == ['spawn', 'fork'] or
-                            methods == ['fork', 'spawn', 'forkserver'] or
-                            methods == ['spawn', 'fork', 'forkserver'])
+            # POSIX
+            self.assertIn('fork', methods)
+            if other_methods := set(methods) - {'fork', 'spawn'}:
+                # If there are more than those two, forkserver must be one.
+                self.assertEqual({'forkserver'}, other_methods)
+            # The default is the first method in the list.
+            self.assertIn(methods[0], {'forkserver', 'spawn'},
+                          msg='3.14+ default must not be fork')
+            if methods[0] == 'spawn':
+                # Confirm that the current default selection logic prefers
+                # forkserver vs spawn when available.
+                self.assertNotIn('forkserver', methods)
 
     def test_preload_resources(self):
         if multiprocessing.get_start_method() != 'forkserver':
@@ -5731,6 +5761,8 @@ class TestResourceTracker(unittest.TestCase):
         # Catchable signal (ignored by semaphore tracker)
         self.check_resource_tracker_death(signal.SIGTERM, False)
 
+    @unittest.skipIf(sys.platform.startswith("netbsd"),
+                     "gh-125620: Skip on NetBSD due to long wait for SIGKILL process termination.")
     def test_resource_tracker_sigkill(self):
         # Uncatchable signal.
         self.check_resource_tracker_death(signal.SIGKILL, True)
@@ -5815,6 +5847,15 @@ class TestSimpleQueue(unittest.TestCase):
             queue.put(queue.empty())
         finally:
             parent_can_continue.set()
+
+    def test_empty_exceptions(self):
+        # Assert that checking emptiness of a closed queue raises
+        # an OSError, independently of whether the queue was used
+        # or not. This differs from Queue and JoinableQueue.
+        q = multiprocessing.SimpleQueue()
+        q.close()  # close the pipe
+        with self.assertRaisesRegex(OSError, 'is closed'):
+            q.empty()
 
     def test_empty(self):
         queue = multiprocessing.SimpleQueue()
@@ -6065,12 +6106,30 @@ class TestSyncManagerTypes(unittest.TestCase):
         case.assertEqual(obj[0], 5)
         case.assertEqual(obj.count(5), 1)
         case.assertEqual(obj.index(5), 0)
+        obj += [7]
+        case.assertIsInstance(obj, multiprocessing.managers.ListProxy)
+        case.assertListEqual(list(obj), [5, 7])
+        obj *= 2
+        case.assertIsInstance(obj, multiprocessing.managers.ListProxy)
+        case.assertListEqual(list(obj), [5, 7, 5, 7])
+        double_obj = obj * 2
+        case.assertIsInstance(double_obj, list)
+        case.assertListEqual(list(double_obj), [5, 7, 5, 7, 5, 7, 5, 7])
+        double_obj = 2 * obj
+        case.assertIsInstance(double_obj, list)
+        case.assertListEqual(list(double_obj), [5, 7, 5, 7, 5, 7, 5, 7])
+        copied_obj = obj.copy()
+        case.assertIsInstance(copied_obj, list)
+        case.assertListEqual(list(copied_obj), [5, 7, 5, 7])
+        obj.extend(double_obj + copied_obj)
         obj.sort()
         obj.reverse()
         for x in obj:
             pass
-        case.assertEqual(len(obj), 1)
-        case.assertEqual(obj.pop(0), 5)
+        case.assertEqual(len(obj), 16)
+        case.assertEqual(obj.pop(0), 7)
+        obj.clear()
+        case.assertEqual(len(obj), 0)
 
     def test_list(self):
         o = self.manager.list()
@@ -6089,7 +6148,29 @@ class TestSyncManagerTypes(unittest.TestCase):
         case.assertListEqual(list(obj.keys()), ['foo'])
         case.assertListEqual(list(obj.values()), [5])
         case.assertDictEqual(obj.copy(), {'foo': 5})
-        case.assertTupleEqual(obj.popitem(), ('foo', 5))
+        obj |= {'bar': 6}
+        case.assertIsInstance(obj, multiprocessing.managers.DictProxy)
+        case.assertDictEqual(dict(obj), {'foo': 5, 'bar': 6})
+        x = reversed(obj)
+        case.assertIsInstance(x, type(iter([])))
+        case.assertListEqual(list(x), ['bar', 'foo'])
+        x = {'bar': 7, 'baz': 7} | obj
+        case.assertIsInstance(x, dict)
+        case.assertDictEqual(dict(x), {'foo': 5, 'bar': 6, 'baz': 7})
+        x = obj | {'bar': 7, 'baz': 7}
+        case.assertIsInstance(x, dict)
+        case.assertDictEqual(dict(x), {'foo': 5, 'bar': 7, 'baz': 7})
+        x = obj.fromkeys(['bar'], 6)
+        case.assertIsInstance(x, dict)
+        case.assertDictEqual(x, {'bar': 6})
+        x = obj.popitem()
+        case.assertIsInstance(x, tuple)
+        case.assertTupleEqual(x, ('bar', 6))
+        obj.setdefault('bar', 0)
+        obj.update({'bar': 7})
+        case.assertEqual(obj.pop('bar'), 7)
+        obj.clear()
+        case.assertEqual(len(obj), 0)
 
     def test_dict(self):
         o = self.manager.dict()
@@ -6160,6 +6241,29 @@ class TestNamedResource(unittest.TestCase):
         # on error, err = 'UserWarning: resource_tracker: There appear to
         # be 1 leaked semaphore objects to clean up at shutdown'
         self.assertFalse(err, msg=err.decode('utf-8'))
+
+
+class _TestAtExit(BaseTestCase):
+
+    ALLOWED_TYPES = ('processes',)
+
+    @classmethod
+    def _write_file_at_exit(self, output_path):
+        import atexit
+        def exit_handler():
+            with open(output_path, 'w') as f:
+                f.write("deadbeef")
+        atexit.register(exit_handler)
+
+    def test_atexit(self):
+        # gh-83856
+        with os_helper.temp_dir() as temp_dir:
+            output_path = os.path.join(temp_dir, 'output.txt')
+            p = self.Process(target=self._write_file_at_exit, args=(output_path,))
+            p.start()
+            p.join()
+            with open(output_path) as f:
+                self.assertEqual(f.read(), 'deadbeef')
 
 
 class MiscTestCase(unittest.TestCase):

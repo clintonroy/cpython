@@ -8,7 +8,7 @@ echo.version(s) of Microsoft Visual Studio to be installed (see readme.txt).
 echo.
 echo.After the flags recognized by this script, up to 9 arguments to be passed
 echo.directly to MSBuild may be passed.  If the argument contains an '=', the
-echo.entire argument must be quoted (e.g. `%~nx0 "/p:PlatformToolset=v100"`).
+echo.entire argument must be quoted (e.g. `%~nx0 "/p:PlatformToolset=v141"`).
 echo.Alternatively you can put extra flags for MSBuild in a file named 
 echo.`msbuild.rsp` in the `PCbuild` directory, one flag per line. This file
 echo.will be picked automatically by MSBuild. Flags put in this file does not
@@ -68,7 +68,7 @@ set verbose=/nologo /v:m /clp:summary
 set kill=
 set do_pgo=
 set pgo_job=-m test --pgo
-set UseTIER2=0
+set UseTIER2=
 
 :CheckOpts
 if "%~1"=="-h" goto Usage
